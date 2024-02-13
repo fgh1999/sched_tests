@@ -35,6 +35,8 @@ int test_set_prio(int which, int who, int new_nice)
         else
         {
             err_log("failed to set nice value");
+            if (errno == EPERM)
+                log("Permission denied => run as root\n");
             return -1;
         }
         return 0;
