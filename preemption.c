@@ -1,22 +1,23 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include <stdlib.h>
-#include "log.h"
-#include "priority.h"
-#include "workload.h"
 #include <time.h>
 #include <string.h>
 #include <sys/wait.h>
+#include "log.h"
+#include "priority.h"
+#include "workload.h"
+#include "shm.h"
 
 typedef void (*workload_t)(void);
 
 typedef struct worker_t
 {
     int pid;
-    int nice;           // normal priority value
+    int nice; // normal priority value
     workload_t workload;
-    time_t start_time;  // The time when the workload is started.
-    time_t end_time;    // The time when the workload finishes.
+    time_t start_time; // The time when the workload is started.
+    time_t end_time;   // The time when the workload finishes.
 } worker_t;
 
 typedef struct worker_collection_t
@@ -25,28 +26,27 @@ typedef struct worker_collection_t
     int count;
 } worker_collection_t;
 
-worker_t *fork_normal_worker(workload_t workload, int nice)
+void fork_normal_worker(int shmid_workers, size_t offset, workload_t workload, int nice)
 {
-    worker_t *worker = malloc(sizeof(worker_t));
-    memset(worker, 0, sizeof(worker_t));
-
     int pid = fork();
-    if (pid == 0)
-    {
-        worker->workload = workload;
-        if (set_normal_prio(PRIO_PROCESS, 0, nice) == 0)
-            worker->nice = nice;
-        else
-            exit(EXIT_FAILURE);
+    if (pid != 0)
+        return;
 
-        worker->start_time = time(NULL);
-        worker->workload();
-        worker->end_time = time(NULL);
-        exit(EXIT_SUCCESS);
-    }
+    worker_t *worker = (worker_t *)_shmat(shmid_workers, 0) + offset;
+    bzero(worker, sizeof(worker_t));
+    worker->pid = getpid();
+    worker->workload = workload;
+    if (set_normal_prio(PRIO_PROCESS, 0, nice) == 0)
+        worker->nice = nice;
+    else
+        exit(EXIT_FAILURE);
 
-    worker->pid = pid;
-    return worker;
+    time(&(worker->start_time)); // TODO: in secs, not enough precision?
+    log("starts at %ld with nice(%d)\n", worker->start_time, worker->nice);
+    worker->workload();
+    time(&(worker->end_time));
+    log("ends at %ld with nice(%d)\n", worker->end_time, worker->nice);
+    exit(EXIT_SUCCESS);
 }
 
 void wait_worker(worker_t *worker)
@@ -57,21 +57,20 @@ void wait_worker(worker_t *worker)
         log("Worker %d exited abnormally\n", worker->pid);
 }
 
-void wait_workers(const worker_collection_t collection)
+void wait_workers(const worker_collection_t *collection)
 {
-    int count = collection.count;
-    while (count-- > 0)
-    {
-        wait_worker(collection.workers[count]);
-    }
+    for (int i = 0; i < collection->count; i++)
+        wait_worker(collection->workers[i]);
 }
 
-void free_workers(const worker_collection_t collection)
+void free_workers(const int shmid_col, const int shmid_workers)
 {
-    for (int i = 0; i < collection.count; i++)
-    {
-        free(collection.workers[i]);
-    }
+    void *shmaddr = _shmat(shmid_workers, 0);
+    _shmdt(shmaddr);
+    shmaddr = _shmat(shmid_col, 0);
+    _shmdt(shmaddr);
+    delshm(shmid_workers);
+    delshm(shmid_col);
 }
 
 /**
@@ -88,22 +87,62 @@ int cmp_worker_by_nice(const void *a, const void *b)
  * @param workers The workers to be checked.
  * @return 1 if the all workers' end time are valid , 0 otherwise.
  */
-int valid_end_time_order(worker_collection_t workers)
+int valid_end_time_order(const worker_collection_t *workers)
 {
-    qsort(workers.workers, workers.count, sizeof(worker_t *), cmp_worker_by_nice);
-    for (int i = 0; i < workers.count - 1; i++)
-    {
-        if (difftime(workers.workers[i]->end_time, workers.workers[i + 1]->end_time) > 0)
-        {
+    qsort(workers->workers, workers->count, sizeof(worker_t *), cmp_worker_by_nice);
+    for (int i = 0; i < workers->count - 1; i++)
+        if (difftime(workers->workers[i]->end_time, workers->workers[i + 1]->end_time) > 0)
             return 0;
-        }
-    }
     return 1;
+}
+
+void log_worker_end_times(const worker_collection_t *workers)
+{
+    for (int i = 0; i < workers->count; i++)
+    {
+        const worker_t *worker = workers->workers[i];
+        log("Worker %d's end time: %ld\n", worker->pid, worker->end_time);
+    }
+}
+
+/**
+ * @brief Test the workers' behavior under different nice values and the same workload.
+ *
+ * @param worker_count The number of workers to be tested.
+ * @param nice_targets The target nice values of the workers.
+ * @param workload The workload to be tested.
+ * @return 1 if the all workers' end time are valid , 0 otherwise.
+ */
+int test_case(const int worker_count, const int *nice_targets, workload_t workload)
+{
+    int shmid_col = getshm_for("./.sched_test_worker_collection", sizeof(worker_collection_t));
+    worker_collection_t *worker_collection = _shmat(shmid_col, 0);
+    bzero(worker_collection, sizeof(worker_collection_t));
+    
+    int shmid_workers = getshm_for("./.sched_test_workers", sizeof(worker_t) * worker_count);
+    worker_t* workers = _shmat(shmid_workers, 0);
+    bzero(workers, sizeof(worker_t) * worker_count);
+    worker_collection->count = worker_count;
+    worker_collection->workers = (worker_t **)malloc(sizeof(worker_t *) * worker_count);
+    for (int i = 0; i < worker_count; i++)
+        worker_collection->workers[i] = workers + i;
+    log("shared memory is allocated\n");
+
+    for (size_t i = 0; i < worker_collection->count; i++)
+        fork_normal_worker(shmid_workers, i, workload, nice_targets[i]);
+
+    wait_workers(worker_collection);
+    int ret = valid_end_time_order(worker_collection);
+    if (ret == 0)
+        log("Some workers' end time are invalid\n");
+    log_worker_end_times(worker_collection);
+    free_workers(shmid_col, shmid_workers);
+    return ret;
 }
 
 void io_bound_workload()
 {
-    sleep_for(5, 1);
+    sleep_for(3, 1);
 }
 
 /**
@@ -115,25 +154,14 @@ void io_bound_workload()
  */
 int io_bound_test(const int worker_count, const int *nice_targets)
 {
-    worker_collection_t worker_collection = {
-        .workers = malloc(sizeof(worker_t *) * worker_count),
-        .count = worker_count,
-    };
-
-    for (int i = 0; i < worker_collection.count; i++)
-        worker_collection.workers[i] = fork_normal_worker(io_bound_workload, nice_targets[i]);
-
-    wait_workers(worker_collection);
-    int ret = valid_end_time_order(worker_collection);
-    if (ret == 0)
-        log("Some workers' end time are invalid\n");
-    free_workers(worker_collection);
-    return ret;
+    log("starts io_bound_test\n");
+    return test_case(worker_count, nice_targets, io_bound_workload);
 }
 
 int main()
 {
-    if (!io_bound_test(2, (int[]){1, 2}))
+    int worker_num = 3;
+    if (!io_bound_test(worker_num, (int[]){1, 2, 3}))
         log("io_bound_test failed\n");
     // 工作负载：
     // 计算的话比如素因子分解，IO就用“中间包含间断的sleep”模拟一下吧
