@@ -101,7 +101,7 @@ void log_worker_end_times(const worker_collection_t *workers)
     for (int i = 0; i < workers->count; i++)
     {
         const worker_t *worker = workers->workers[i];
-        log("Worker %d's end time: %ld\n", worker->pid, worker->end_time);
+        log("Worker %d(nice:%d)'s end time: %ld\n", worker->pid, worker->nice, worker->end_time);
     }
 }
 
@@ -118,9 +118,9 @@ int test_case(const int worker_count, const int *nice_targets, workload_t worklo
     int shmid_col = getshm_for("./.sched_test_worker_collection", sizeof(worker_collection_t));
     worker_collection_t *worker_collection = _shmat(shmid_col, 0);
     bzero(worker_collection, sizeof(worker_collection_t));
-    
+
     int shmid_workers = getshm_for("./.sched_test_workers", sizeof(worker_t) * worker_count);
-    worker_t* workers = _shmat(shmid_workers, 0);
+    worker_t *workers = _shmat(shmid_workers, 0);
     bzero(workers, sizeof(worker_t) * worker_count);
     worker_collection->count = worker_count;
     worker_collection->workers = (worker_t **)malloc(sizeof(worker_t *) * worker_count);
@@ -158,11 +158,25 @@ int io_bound_test(const int worker_count, const int *nice_targets)
     return test_case(worker_count, nice_targets, io_bound_workload);
 }
 
+int cpu_bound_test(const int worker_count, const int *nice_targets)
+{
+    log("starts cpu_bound_test\n");
+    return test_case(worker_count, nice_targets, burn_cpu);
+}
+
 int main()
 {
     int worker_num = 3;
-    if (!io_bound_test(worker_num, (int[]){1, 2, 3}))
+    int *nice_targets = (int *)malloc(sizeof(int) * worker_num);
+    for (int i = 0; i < worker_num; i++)
+        nice_targets[i] = i * 10;
+
+    if (!io_bound_test(worker_num, nice_targets))
         log("io_bound_test failed\n");
+
+    if (!cpu_bound_test(worker_num, nice_targets))
+        log("cpu_bound_test failed\n");
+
     // 工作负载：
     // 计算的话比如素因子分解，IO就用“中间包含间断的sleep”模拟一下吧
     // 可以多试几种工作负载
@@ -172,7 +186,7 @@ int main()
 
     // 期望：（注意：优先级越高，其数值反而更低）
     // 优先级高的进程能够更多的占用CPU时间
-    // 预期能够观察到：优先级高的进程更早结束
+    // 单核环境下预期能够观察到：优先级高的进程更早结束
 
     // 当前先在linux gcc环境下测试就行
     // 等#599、徐老师的amendment都合入后，可抢占的调度器实现才会用得到这个测试
